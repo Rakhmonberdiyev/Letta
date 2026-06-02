@@ -13,8 +13,7 @@ You are a fact-checking assistant.
 Your only job: compare the AI response against the provided evidence.
 - If a claim in the response is clearly not supported by the evidence,
   append "(unverified)" after that claim.
-- If the response is well-grounded or no evidence was needed, return it unchanged.
-- Return ONLY the final response text — no commentary, no preamble."""
+- If the response is well-grounded or no evidence was needed, return it unchanged."""
 
 _GROUNDING_PROMPT = """\
 Evidence / context:

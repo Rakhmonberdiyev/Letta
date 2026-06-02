@@ -153,19 +153,19 @@ def err(msg: str) -> None:
 # ── Tool calls ─────────────────────────────────────────────────────────────────
 
 def tool_call(tool_name: str, args: str) -> None:
-    console.print(
-        f"  [tool]🔧 TOOL CALL → {tool_name}[/tool]\n"
-        f"      [label]args:[/label] [query]{args[:300]}[/query]"
-    )
+    console.print(Panel(
+        Text(args, style="cyan"),
+        title=f"[tool]🔧 TOOL CALL → {tool_name}[/tool]",
+        border_style="magenta",
+        padding=(0, 1),
+    ))
     _last_tool.set(tool_name)
     _emit(level="tool_call", name=tool_name, args=args[:200])
 
 
 def tool_result(text: str) -> None:
-    preview = text[:1500]
-    suffix = f"\n[dim]…+{len(text)-1500} chars truncated[/dim]" if len(text) > 1500 else ""
     console.print(Panel(
-        Text(preview + suffix, style="dim"),
+        Text(text, style="dim"),
         title="[dim]↳ TOOL RESULT (sent back to LLM)[/dim]",
         border_style="dim cyan",
         padding=(0, 1),
@@ -305,6 +305,136 @@ def save_mem0(user_input: str, response: str) -> None:
     """Show what text is being upserted to Mem0 LTM."""
     combined = f"User: {user_input[:120]}  |  Assistant: {response[:120]}"
     console.print(f"      [yellow]{combined.replace(chr(10), ' ')}[/yellow]")
+
+
+# ── Letta inference trace ─────────────────────────────────────────────────────
+
+def letta_tools_list(tools: list[dict]) -> None:
+    """Show every tool name being registered as a client_tool for this Letta call."""
+    names = "  ".join(t.get("name", "?") for t in tools)
+    console.print(
+        f"  [bold magenta]⚙  CLIENT TOOLS → LLM  ({len(tools)} total)[/bold magenta]\n"
+        f"      [dim]{names}[/dim]"
+    )
+
+
+def letta_context_dump(
+    system: str,
+    blocks: dict,
+    recent_turns: list[dict],
+    user_input: str = "",
+    tools_token_count: int = 0,
+) -> None:
+    """Show the complete LLM context + per-section token estimates in one panel.
+
+    Archival memory is NOT shown here — the LLM calls archival_memory_search
+    as a tool during inference when it needs it (on-demand, not pre-injected).
+    """
+    from rich.console import Group
+
+    def _tok(text: str) -> int:
+        return max(1, len(text) // 4)
+
+    lines: list = []
+
+    # ── System Prompt ──────────────────────────────────────────────────────────
+    sys_tok = _tok(system)
+    lines.append(Text(f"── SYSTEM PROMPT  ≈{sys_tok:,} tok ─────────────────────", style="dim"))
+    lines.append(Text(system.strip(), style="yellow dim"))
+
+    # ── Core Memory ───────────────────────────────────────────────────────────
+    core_text = "\n".join(v for v in blocks.values() if v)
+    core_tok  = _tok(core_text)
+    lines.append(Text(f"\n── CORE MEMORY  ≈{core_tok:,} tok ──────────────────────", style="dim"))
+    for label, value in blocks.items():
+        lines.append(Text(f"[{label}]", style="bold cyan"))
+        lines.append(Text(value.strip() if value else "(empty)", style="cyan dim"))
+
+    # ── Recall Memory ─────────────────────────────────────────────────────────
+    recall_text = "\n".join(m.get("content", "") for m in recent_turns)
+    recall_tok  = _tok(recall_text) if recent_turns else 0
+    lines.append(Text(f"\n── RECALL MEMORY  ≈{recall_tok:,} tok ──────────────────", style="dim"))
+    if recent_turns:
+        for m in recent_turns[-6:]:
+            role    = m.get("role", "?")
+            color   = "green" if role == "user" else "blue"
+            tag     = "USER " if role == "user" else "AGENT"
+            content = (m.get("content") or "")[:120]
+            lines.append(Text(f"[{tag}] {content}", style=color + " dim"))
+    else:
+        lines.append(Text("(no turns yet)", style="dim"))
+
+    # ── User Message ──────────────────────────────────────────────────────────
+    input_tok = _tok(user_input)
+    lines.append(Text(f"\n── USER MESSAGE  ≈{input_tok:,} tok ─────────────────────", style="dim"))
+    lines.append(Text(user_input, style="white"))
+
+    # ── Token summary ─────────────────────────────────────────────────────────
+    total = sys_tok + core_tok + recall_tok + input_tok + tools_token_count
+    lines.append(Text("", style=""))
+    lines.append(Text("─" * 52, style="dim"))
+    lines.append(Text(
+        f"  system={sys_tok:,}  core={core_tok:,}  recall={recall_tok:,}  "
+        f"input={input_tok:,}  tools={tools_token_count:,}",
+        style="dim",
+    ))
+    lines.append(Text(
+        f"  TOTAL ≈ {total:,} tokens  /  32,768 context window  "
+        f"({total / 32768 * 100:.0f}% used)",
+        style="bold yellow",
+    ))
+
+    console.print(Panel(
+        Group(*lines),
+        title="[bold yellow]📋  FULL LLM CONTEXT[/bold yellow]",
+        border_style="yellow dim",
+        padding=(0, 1),
+    ))
+
+
+def letta_input(text: str) -> None:
+    pass  # merged into letta_context_dump
+
+
+def letta_step(n: int) -> None:
+    """Show the current inference step number."""
+    console.print(f"  [dim cyan]── Inference step {n} ─────────────────────────────────[/dim cyan]")
+
+
+def letta_thinking(text: str) -> None:
+    """Show Letta's internal monologue (reasoning before a tool call or reply)."""
+    short = text[:500] + ("…" if len(text) > 500 else "")
+    console.print(Panel(
+        Text(short, style="dim italic"),
+        title="[yellow]💭  Inner Monologue[/yellow]",
+        border_style="yellow dim",
+        padding=(0, 1),
+    ))
+
+
+def memory_call(tool_name: str, args: dict) -> None:
+    """Highlight a memory tool call (Core / Recall / Archival)."""
+    import json as _json
+    args_str = _json.dumps(args, ensure_ascii=False)[:300]
+    console.print(
+        f"  [bold yellow]🧠 MEMORY → {tool_name}[/bold yellow]\n"
+        f"      [dim]{args_str}[/dim]"
+    )
+    _last_tool.set(tool_name)
+    _emit(level="memory_call", name=tool_name, args=args_str)
+
+
+def memory_result(text: str) -> None:
+    """Show the result returned from a memory tool."""
+    preview = text[:600]
+    suffix = f"\n[dim]…+{len(text)-600} chars[/dim]" if len(text) > 600 else ""
+    console.print(Panel(
+        Text(preview + suffix, style="yellow dim"),
+        title="[dim yellow]↳ MEMORY RESULT[/dim yellow]",
+        border_style="yellow dim",
+        padding=(0, 1),
+    ))
+    _emit(level="memory_result", preview=text[:200])
 
 
 # ── Reasoning block ────────────────────────────────────────────────────────────

@@ -1,169 +1,199 @@
-"""Redis-backed multi-session history (short-term memory)."""
+"""
+Recall Memory — thin adapter delegating to Letta's remote server.
 
-import json
-import uuid
+Official Letta architecture: all message storage is handled by Letta's SQL DB
+via the Conversations API.  This module is a compatibility shim that:
+
+  - Translates the existing session API into Letta conversations.create / .list / .messages
+  - Keeps user_docs in a local SQLite table (Letta has no file-tracking concept)
+  - save_turn() is a deliberate no-op — Letta persists every turn automatically
+    when inference is routed through letta_mem.letta_inference()
+"""
+
+import asyncio
+import sqlite3
 from datetime import datetime
+from pathlib import Path
 
-import redis.asyncio as aioredis
-from config import REDIS_HOST, REDIS_PORT, MAX_SESSION_MESSAGES
-
-_redis: aioredis.Redis | None = None
-
-# TTLs
-_HISTORY_TTL = 30 * 86400   # 30 days — individual session history
-_META_TTL    = 90 * 86400   # 90 days — sessions list + current pointer
-MAX_SESSIONS = 20            # max sessions kept per user
-
-# Docs
-_DOCS_TTL = 30 * 86400
-_MAX_DOCS  = 10
+_DOCS_DB  = str(Path(__file__).parent / "user_docs.db")
+_MAX_DOCS = 10
+ACTIVE_TURNS = 5
 
 
-async def _get_redis() -> aioredis.Redis:
-    global _redis
-    if _redis is None:
-        _redis = await aioredis.from_url(
-            f"redis://{REDIS_HOST}:{REDIS_PORT}",
-            decode_responses=True,
+# ── Local SQLite for user_docs only ──────────────────────────────────────────
+
+def _init_docs_db() -> None:
+    with sqlite3.connect(_DOCS_DB) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_docs (
+                id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id   TEXT NOT NULL,
+                filename  TEXT NOT NULL,
+                added_at  TEXT NOT NULL
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_docs_user ON user_docs(user_id, id)"
         )
-    return _redis
 
 
-def _new_sid() -> str:
-    return f"s_{uuid.uuid4().hex[:12]}"
+_init_docs_db()
 
 
-# ── Session ID management ──────────────────────────────────────────────────────
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _get_docs_sync(user_id: str) -> list[str]:
+    with sqlite3.connect(_DOCS_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT filename FROM user_docs WHERE user_id = ? ORDER BY id DESC LIMIT ?",
+            (user_id, _MAX_DOCS),
+        ).fetchall()
+        return [r["filename"] for r in rows]
+
+
+def _add_doc_sync(user_id: str, filename: str) -> None:
+    with sqlite3.connect(_DOCS_DB) as conn:
+        conn.execute(
+            "INSERT INTO user_docs (user_id, filename, added_at) VALUES (?,?,?)",
+            (user_id, filename, _now()),
+        )
+        conn.execute(
+            "DELETE FROM user_docs WHERE id IN ("
+            "  SELECT id FROM user_docs WHERE user_id = ? ORDER BY id DESC LIMIT -1 OFFSET ?"
+            ")",
+            (user_id, _MAX_DOCS),
+        )
+
+
+# ── Helpers to resolve agent_id + conv_id from user_id ───────────────────────
+
+async def _agent(user_id: str) -> str | None:
+    from memory.letta_mem import get_or_create_agent
+    return await get_or_create_agent(user_id)
+
+
+async def _conv(user_id: str) -> str | None:
+    from memory.letta_mem import get_or_create_agent, get_or_create_conversation
+    agent_id = await get_or_create_agent(user_id)
+    if not agent_id:
+        return None
+    return await get_or_create_conversation(user_id, agent_id)
+
+
+# ── Session ID management ─────────────────────────────────────────────────────
 
 async def get_current_session_id(user_id: str) -> str:
-    """Return active session_id; auto-creates one if the user has none."""
-    r   = await _get_redis()
-    sid = await r.get(f"current_session:{user_id}")
-    if not sid:
-        sid = await create_session(user_id)
-    return sid
+    conv_id = await _conv(user_id)
+    return conv_id or ""
 
 
 async def create_session(user_id: str, title: str = "New Session") -> str:
-    """
-    Create a new session, set it as the active session, add to sessions list.
-    Returns the new session_id.
-    """
-    r   = await _get_redis()
-    sid = _new_sid()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-
-    meta     = {"id": sid, "title": title, "created_at": now, "message_count": 0}
-    sessions = await get_sessions_list(user_id)
-    sessions.insert(0, meta)
-
-    # Drop oldest sessions beyond the cap
-    if len(sessions) > MAX_SESSIONS:
-        for old in sessions[MAX_SESSIONS:]:
-            await r.delete(f"history:{user_id}:{old['id']}")
-        sessions = sessions[:MAX_SESSIONS]
-
-    await r.setex(f"sessions:{user_id}",        _META_TTL, json.dumps(sessions))
-    await r.setex(f"current_session:{user_id}", _META_TTL, sid)
-    return sid
+    from memory.letta_mem import get_or_create_agent, create_conversation
+    agent_id = await get_or_create_agent(user_id)
+    if not agent_id:
+        return ""
+    conv_id = await create_conversation(user_id, agent_id, title)
+    return conv_id or ""
 
 
 async def switch_session(user_id: str, session_id: str) -> bool:
-    """
-    Make session_id the active session.
-    Returns True if the session exists, False otherwise.
-    """
-    sessions = await get_sessions_list(user_id)
-    if not any(s["id"] == session_id for s in sessions):
+    from memory.letta_mem import _verify_conv_sync, set_active_conversation
+    valid = await asyncio.to_thread(_verify_conv_sync, session_id)
+    if not valid:
         return False
-    r = await _get_redis()
-    await r.setex(f"current_session:{user_id}", _META_TTL, session_id)
+    await set_active_conversation(user_id, session_id)
     return True
 
 
 async def get_sessions_list(user_id: str) -> list[dict]:
-    """Return all session metadata for a user, newest first."""
-    r    = await _get_redis()
-    data = await r.get(f"sessions:{user_id}")
-    return json.loads(data) if data else []
+    from memory.letta_mem import get_or_create_agent, list_conversations
+    agent_id = await get_or_create_agent(user_id)
+    if not agent_id:
+        return []
+    return await list_conversations(agent_id)
 
 
 async def get_current_session_meta(user_id: str) -> dict | None:
-    """Return metadata dict for the currently active session."""
-    sid      = await get_current_session_id(user_id)
-    sessions = await get_sessions_list(user_id)
-    return next((s for s in sessions if s["id"] == sid), None)
+    from memory.letta_mem import get_conv_meta
+    conv_id = await _conv(user_id)
+    if not conv_id:
+        return None
+    return await get_conv_meta(conv_id)
 
 
-# ── History access (public API used by agent.py — signatures unchanged) ────────
+# ── Message history (reads from Letta's SQL DB) ───────────────────────────────
 
 async def get_session(user_id: str) -> list[dict]:
-    """Return message history for the active session."""
-    sid  = await get_current_session_id(user_id)
-    r    = await _get_redis()
-    data = await r.get(f"history:{user_id}:{sid}")
-    return json.loads(data) if data else []
-
-
-async def save_turn(user_id: str, user_msg: str, assistant_msg: str) -> None:
-    """Append a turn to the active session and update session metadata."""
-    sid = await get_current_session_id(user_id)
-    r   = await _get_redis()
-
-    key     = f"history:{user_id}:{sid}"
-    data    = await r.get(key)
-    history = json.loads(data) if data else []
-    history.append({"role": "user",      "content": user_msg})
-    history.append({"role": "assistant", "content": assistant_msg})
-    if len(history) > MAX_SESSION_MESSAGES:
-        history = history[-MAX_SESSION_MESSAGES:]
-    await r.setex(key, _HISTORY_TTL, json.dumps(history))
-
-    # Update title from first user message + message count
-    sessions = await get_sessions_list(user_id)
-    for s in sessions:
-        if s["id"] == sid:
-            s["message_count"] = len(history) // 2
-            if s.get("title") in ("New Session", "") and user_msg.strip():
-                s["title"] = user_msg.strip()[:40]
-            break
-    await r.setex(f"sessions:{user_id}", _META_TTL, json.dumps(sessions))
+    from memory.letta_mem import get_or_create_agent, get_conv_messages
+    agent_id = await _agent(user_id)
+    conv_id  = await _conv(user_id)
+    if not agent_id or not conv_id:
+        return []
+    return await get_conv_messages(conv_id, agent_id, limit=40)
 
 
 async def get_session_history(user_id: str, session_id: str) -> list[dict]:
-    """Return message history for a specific session by ID."""
-    r    = await _get_redis()
-    data = await r.get(f"history:{user_id}:{session_id}")
-    return json.loads(data) if data else []
+    from memory.letta_mem import get_or_create_agent, get_conv_messages
+    agent_id = await _agent(user_id)
+    if not agent_id:
+        return []
+    return await get_conv_messages(session_id, agent_id, limit=40)
+
+
+async def get_active_buffer(user_id: str) -> list[dict]:
+    history = await get_session(user_id)
+    return history[-(ACTIVE_TURNS * 2):]
+
+
+async def get_older_history(user_id: str) -> list[dict]:
+    history = await get_session(user_id)
+    cutoff  = len(history) - ACTIVE_TURNS * 2
+    return history[:cutoff] if cutoff > 0 else []
+
+
+async def save_turn(user_id: str, user_msg: str, assistant_msg: str) -> None:
+    # Letta stores the turn automatically when inference is routed through
+    # letta_mem.letta_inference() → this is intentionally a no-op.
+    pass
 
 
 async def clear_session(user_id: str) -> None:
-    """Delete history of the active session (session stays in the list)."""
-    sid = await get_current_session_id(user_id)
-    r   = await _get_redis()
-    await r.delete(f"history:{user_id}:{sid}")
-
-    sessions = await get_sessions_list(user_id)
-    for s in sessions:
-        if s["id"] == sid:
-            s["message_count"] = 0
-            break
-    await r.setex(f"sessions:{user_id}", _META_TTL, json.dumps(sessions))
+    from letta_client import Letta
+    from memory.letta_mem import LETTA_BASE_URL, LETTA_SERVER_PASS, _get_client
+    client  = _get_client()
+    conv_id = await _conv(user_id)
+    if client and conv_id:
+        try:
+            client.conversations.reset_messages(conv_id)
+        except Exception:
+            pass
 
 
-# ── Per-user uploaded document tracking (unchanged) ───────────────────────────
+# ── Session summary (stored in Letta conversation summary field) ───────────────
+
+async def get_session_summary(user_id: str) -> str:
+    from memory.letta_mem import get_conv_summary
+    conv_id = await _conv(user_id)
+    if not conv_id:
+        return ""
+    return await get_conv_summary(conv_id)
+
+
+async def save_session_summary(user_id: str, summary: str) -> None:
+    from memory.letta_mem import update_conv_summary
+    conv_id = await _conv(user_id)
+    if conv_id:
+        await update_conv_summary(conv_id, summary)
+
+
+# ── User-uploaded documents (local SQLite) ────────────────────────────────────
 
 async def get_user_docs(user_id: str) -> list[str]:
-    """Return filenames uploaded by this user, most recent first."""
-    r     = await _get_redis()
-    items = await r.lrange(f"docs:{user_id}", 0, _MAX_DOCS - 1)
-    return items
+    return await asyncio.to_thread(_get_docs_sync, user_id)
 
 
 async def add_user_doc(user_id: str, filename: str) -> None:
-    """Prepend filename and cap list at _MAX_DOCS."""
-    r   = await _get_redis()
-    key = f"docs:{user_id}"
-    await r.lpush(key, filename)
-    await r.ltrim(key, 0, _MAX_DOCS - 1)
-    await r.expire(key, _DOCS_TTL)
+    await asyncio.to_thread(_add_doc_sync, user_id, filename)

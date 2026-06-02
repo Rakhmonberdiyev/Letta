@@ -97,13 +97,12 @@ class _TelegramStreamer:
         return self._buf
 
 
-# ── Per-user settings (in-memory) ─────────────────────────────────────────────
-# {telegram_user_id: {"deepthink": bool}}
+
 _settings: dict[int, dict] = {}
 
 
 def _get_deepthink(uid: int) -> bool:
-    return _settings.setdefault(uid, {"deepthink": True})["deepthink"]
+    return _settings.setdefault(uid, {"deepthink": False})["deepthink"]
 
 
 def _set_deepthink(uid: int, val: bool) -> None:
@@ -237,6 +236,24 @@ async def cmd_newsession(message: Message) -> None:
     )
 
 
+@router.message(Command("reset"))
+async def cmd_reset(message: Message) -> None:
+    uid = message.from_user.id
+    status = await message.answer("<i>Resetting conversation…</i>")
+    conv_id = await create_session(str(uid), "Reset Session")
+    if conv_id:
+        await status.edit_text(
+            "✅ <b>Conversation reset.</b>\n"
+            "A fresh session has started — previous sessions are still accessible via /sessions.",
+            reply_markup=_keyboard(uid),
+        )
+    else:
+        await status.edit_text(
+            "❌ Reset failed — Letta server may be unreachable.",
+            reply_markup=_keyboard(uid),
+        )
+
+
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(
@@ -245,6 +262,7 @@ async def cmd_help(message: Message) -> None:
         "/mode       — Show current mode\n"
         "/sessions   — View &amp; switch between sessions\n"
         "/newsession — Start a new session\n"
+        "/reset      — Reset conversation (use if bot stops responding)\n"
         "/help       — This message\n\n"
         "<b>Buttons on each reply:</b>\n"
         "🧠 Deepthink / ⚡ Fast  — switch reasoning mode\n"
@@ -484,6 +502,7 @@ async def main() -> None:
         BotCommand(command="mode",       description="Show current mode"),
         BotCommand(command="sessions",   description="View & switch sessions"),
         BotCommand(command="newsession", description="Start a new session"),
+        BotCommand(command="reset",      description="Reset current conversation (fix stuck responses)"),
         BotCommand(command="help",       description="Help & commands"),
     ])
 
