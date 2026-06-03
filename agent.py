@@ -29,7 +29,6 @@ Full pipeline per turn (Official Letta OS Architecture):
 """
 
 import asyncio
-import json
 import re
 import time
 import config
@@ -43,7 +42,6 @@ from memory.letta_mem import (
     get_or_create_conversation,
     letta_inference,
     set_letta_context,
-    append_human_facts,
 )
 from tools.mcp_server  import search_mcp, rag_mcp
 from tools.letta_mcp   import letta_mcp
@@ -75,43 +73,6 @@ _DEEPTHINK_RE = re.compile(
 def _wants_deepthink(text: str) -> bool:
     return bool(_DEEPTHINK_RE.search(text))
 
-
-# ── Personal fact extraction via LLM ─────────────────────────────────────────
-
-_FACT_EXTRACT_PROMPT = """\
-Extract any personal facts about the user from the message below.
-Personal facts include: name, age, profession, workplace, city, country, \
-education, university, family, travel experience, preferences, goals — \
-anything worth remembering long-term about this specific person.
-
-Return ONLY a JSON array of short English strings, or [] if nothing personal.
-Examples:
-  "meni ismim Raximberdi"          → ["Name: Raximberdi"]
-  "men halq bankida ishlayman"     → ["Works at: Halq Bank"]
-  "I graduated from NewUU"         → ["Graduated from: NewUU University"]
-  "sometimes i have been in China" → ["Has visited: China"]
-  "what is the dollar rate?"       → []
-  "men Toshkentda yashaman"        → ["Lives in: Tashkent"]
-
-Message: {message}"""
-
-
-async def _auto_save_facts(agent_id: str, user_input: str, model: str) -> None:
-    """Ask the LLM to extract personal facts and write them to the human block."""
-    try:
-        resp = await config.llm_client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": _FACT_EXTRACT_PROMPT.format(message=user_input)}],
-            temperature=0,
-        )
-        raw = resp.choices[0].message.content or ""
-        clean = re.sub(r"```(?:json)?\s*|\s*```", "", raw).strip()
-        facts = json.loads(clean)
-        if isinstance(facts, list) and facts:
-            await append_human_facts(agent_id, facts)
-            ui.ok(f"[agent] Auto-saved facts: {facts}")
-    except Exception:
-        pass
 
 
 # ── Shared MCP server (all tools as client_tools for Letta) ──────────────────
@@ -339,10 +300,6 @@ async def process_turn(
         stream_callback=stream_callback,
     )
     ui.timing("Letta inference", time.perf_counter() - t_inference)
-
-    # Fire-and-forget: extract personal facts via LLM and save to human block.
-    # Runs after the response is already returned so it adds zero latency.
-    asyncio.create_task(_auto_save_facts(agent_id, user_input, model))
 
     if not response:
         response = "I was unable to generate a response. Please try again."
