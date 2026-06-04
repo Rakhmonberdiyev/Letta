@@ -1,7 +1,7 @@
 """
 benchmark_letta.py — Comprehensive Letta Memory Rules Benchmark
 
-Tests all three Letta OS memory tiers:
+Tests all three Letta OS memory tiers + overflow eviction:
 
   TIER 1 — Core Memory (always in LLM context via memory blocks)
     Rule 1.1  core_memory_append / memory_insert  — called when a new user fact is learned
@@ -13,10 +13,19 @@ Tests all three Letta OS memory tiers:
     Rule 2.1  recent turn recall requires NO conversation_search
     Rule 2.2  distant turn recall DOES trigger conversation_search
 
+    Context Window formula verified by tight 2048-token window:
+      Recall = Context Window − Core − System − User Query − Tools
+
   TIER 3 — Archival Memory (long-term vector store)
     Rule 3.1  archival_memory_insert called when agent is asked to archive data
     Rule 3.2  archival_memory_search called when agent retrieves pre-seeded archival data
               (data seeded via API before the conversation — not in recall at all)
+
+  CORE MEMORY OVERFLOW (cross-tier eviction — Rule 4)
+    Rule 4.1  core_memory_append called for first personal fact
+    Rule 4.2  core_memory_append called for second fact (block now overflows limit)
+    Rule 4.3  archival_memory_search triggered when querying an evicted fact
+              (fact is present ONLY in archival — evicted from core when block was full)
 
 Fixes applied vs v1:
   • Tool names: both old (memory_insert/replace) and new (core_memory_append/replace) accepted
@@ -371,6 +380,149 @@ def _archival_memory_tests(agent_id: str, start: int) -> list[TurnResult]:
     return results
 
 
+# ── Section 4: Core Memory Overflow → Archival Eviction ───────────────────────
+
+_OVERFLOW_LIMIT = 80   # chars — tiny so two personal facts force eviction
+
+
+def _set_block_limit(agent_id: str, label: str, limit: int) -> None:
+    try:
+        blocks = client.agents.blocks.list(agent_id=agent_id)
+        items  = blocks if isinstance(blocks, list) else getattr(blocks, "data", getattr(blocks, "items", []))
+        for blk in items:
+            if getattr(blk, "label", "") == label:
+                client.blocks.update(block_id=blk.id, limit=limit)
+                print(f"  [setup] '{label}' block limit → {limit} chars.")
+                return
+    except Exception as e:
+        print(f"  [setup] Block limit update failed: {e}")
+
+
+def _get_block_value(agent_id: str, label: str) -> str:
+    try:
+        blocks = client.agents.blocks.list(agent_id=agent_id)
+        items  = blocks if isinstance(blocks, list) else getattr(blocks, "data", getattr(blocks, "items", []))
+        for blk in items:
+            if getattr(blk, "label", "") == label:
+                return getattr(blk, "value", "") or ""
+    except Exception:
+        pass
+    return ""
+
+
+def _evict_overflow(agent_id: str, label: str, limit: int) -> list[str]:
+    """
+    Replicate production trim_human_block logic in the benchmark:
+    evict oldest lines from a core memory block to archival if over limit.
+    Returns the list of evicted strings.
+    """
+    try:
+        blocks  = client.agents.blocks.list(agent_id=agent_id)
+        items   = blocks if isinstance(blocks, list) else getattr(blocks, "data", getattr(blocks, "items", []))
+        blk_obj = next((b for b in items if getattr(b, "label", "") == label), None)
+        if blk_obj is None:
+            return []
+        value = getattr(blk_obj, "value", "") or ""
+        if len(value) <= limit:
+            return []
+        lines    = [l for l in value.splitlines() if l.strip()]
+        combined = "\n".join(lines)
+        evicted: list[str] = []
+        while len(combined) > limit and "\n" in combined:
+            idx          = combined.index("\n")
+            evicted_line = combined[:idx].strip()
+            combined     = combined[idx + 1:]
+            if evicted_line:
+                evicted.append(evicted_line)
+        combined = combined[:limit]
+        if evicted:
+            passage = "Evicted from core memory (human block full):\n" + "\n".join(evicted)
+            client.agents.passages.create(agent_id=agent_id, text=passage)
+            print(f"  [evict] {len(evicted)} line(s) → archival: {evicted[:2]}"
+                  f"{'…' if len(evicted) > 2 else ''}")
+        try:
+            client.agents.blocks.update(block_label=label, agent_id=agent_id, value=combined)
+        except Exception:
+            client.blocks.update(block_id=blk_obj.id, value=combined)
+        return evicted
+    except Exception as e:
+        print(f"  [evict] Failed: {e}")
+        return []
+
+
+def _core_overflow_tests(agent_id: str, start: int) -> list[TurnResult]:
+    """
+    Section 4 — Core Memory Overflow → Archival Eviction → Archival Retrieval.
+
+    Rule: when a core memory block fills up, the oldest facts are evicted to
+    archival (not discarded). When the user later queries an evicted fact,
+    the agent must call archival_memory_search — the fact is no longer in core.
+
+    _evict_overflow() replicates the production trim_human_block() logic so the
+    benchmark is self-contained (no import from letta_mem.py).
+
+    Steps:
+      4.1  Store first personal fact → core_memory_append required
+      4.2  Store second fact that together with the first overflows the tiny block
+           (eviction helper runs after each turn to mirror production behaviour)
+      4.3  Query the evicted first fact → archival_memory_search required
+    """
+    results: list[TurnResult] = []
+    turn = start
+
+    # Shrink the human block so two facts together exceed the limit
+    _set_block_limit(agent_id, "human", _OVERFLOW_LIMIT)
+    print()
+
+    conv = client.conversations.create(agent_id=agent_id)
+    print(f"  Conv for overflow tests: {conv.id[:20]}…")
+    print()
+
+    # 4.1 — First personal fact (may or may not overflow yet on its own)
+    tools, text, lat = _send(conv.id, agent_id,
+        "My close university friend is Kamol Tursunov, a software engineer. "
+        "Please save this to your core memory.")
+    r = TurnResult(turn=turn,
+                   section="4.1  Overflow — first fact saved to core",
+                   prompt="Friend Kamol Tursunov…",
+                   tools_called=tools, response_text=text, total_latency_s=lat,
+                   required_tools=_CORE_APPEND)
+    _evaluate(r); _print_result(r); results.append(r); turn += 1
+
+    _evict_overflow(agent_id, "human", _OVERFLOW_LIMIT)
+
+    # 4.2 — Second fact — together both facts overflow the small block
+    tools, text, lat = _send(conv.id, agent_id,
+        "I am a senior data scientist specialising in NLP and LLMs. Update my profile.")
+    r = TurnResult(turn=turn,
+                   section="4.2  Overflow — second fact causes block overflow",
+                   prompt="Senior data scientist…",
+                   tools_called=tools, response_text=text, total_latency_s=lat,
+                   required_tools=_CORE_APPEND)
+    _evaluate(r); _print_result(r); results.append(r); turn += 1
+
+    # Force eviction: oldest facts (Kamol) moved to archival
+    _evict_overflow(agent_id, "human", _OVERFLOW_LIMIT)
+    remaining = _get_block_value(agent_id, "human")
+    print(f"  [4.2] After eviction — human block ({len(remaining)} chars): "
+          f"'{remaining[:60]}{'…' if len(remaining) > 60 else ''}'")
+    print()
+
+    # 4.3 — Query the evicted fact: Kamol is NOT in core memory → must search archival
+    tools, text, lat = _send(conv.id, agent_id,
+        "What is the name of the university friend I told you about earlier? "
+        "Please search your archival memory to find the details.")
+    r = TurnResult(turn=turn,
+                   section="4.3  Overflow — evicted fact via archival_memory_search",
+                   prompt="Who is my university friend? (evicted to archival)",
+                   tools_called=tools, response_text=text, total_latency_s=lat,
+                   required_tools=["archival_memory_search"],
+                   expected_in_response="Kamol")
+    _evaluate(r); _print_result(r); results.append(r)
+
+    return results
+
+
 # ── Scoring ────────────────────────────────────────────────────────────────────
 
 def _report(all_results: list[TurnResult]) -> None:
@@ -485,6 +637,11 @@ def run_benchmark() -> None:
     print("SECTION 3 — Archival Memory (insert + search with pre-seeded data)")
     print("━" * 62)
     all_results.extend(_archival_memory_tests(agent.id, start=len(all_results) + 1))
+
+    print("━" * 62)
+    print("SECTION 4 — Core Memory Overflow (eviction → archival retrieval)")
+    print("━" * 62)
+    all_results.extend(_core_overflow_tests(agent.id, start=len(all_results) + 1))
 
     print("━" * 62)
     _report(all_results)

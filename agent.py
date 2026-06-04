@@ -90,97 +90,6 @@ main_mcp.mount(realtime_mcp, namespace="RealTime")
 
 _FALLBACK_MODEL = "/models/gemma"
 
-# ── Bank query pre-fetch (prevents Gemma from answering without calling tools) ──
-
-_PENSION_KW  = {"pensiya", "pension", "nafaqa", "to'lov kun", "tolov kun",
-                "payment day", "пенсия", "to'lov", "tolov"}
-_DEPOSIT_KW  = {"omonat", "deposit", "депозит", "foiz stavka", "foiz", "омонат"}
-_CREDIT_KW   = {"kredit", "credit", "кредит", "qarz", "loan", "ipoteka",
-                "ипотека", "avtokredit"}
-_CARD_KW     = {"karta", "card", "карта", "visa", "mastercard", "humo",
-                "uzcard", "plastik"}
-_REALTIME_KW = {"valyuta", "kurs", "курс", "dollar", "euro", "евро", "доллар",
-                "exchange rate", "usd", "eur", "rub", "рубл"}
-
-
-def _matches(text: str, keywords: set) -> bool:
-    t = text.lower()
-    return any(k in t for k in keywords)
-
-
-async def _call_tool_safe(tool_name: str, args: dict) -> str:
-    try:
-        result = await main_mcp.call_tool(tool_name, args)
-        return "".join(
-            item.text if getattr(item, "type", "") == "text" else ""
-            for item in (getattr(result, "content", []) or [])
-        ).strip()
-    except Exception as e:
-        return f"(tool error: {e})"
-
-
-async def _prefetch_bank_data(user_input: str) -> str:
-    """
-    For queries about bank products, pre-call the relevant tools and return
-    the data as a string block. This is injected into dynamic_context so the
-    model never needs to guess — it has the real data in front of it.
-    """
-    fetched: list[str] = []
-
-    # ── Pension ─────────────────────────────────────────────────────────────────
-    # Pension queries need region/district/street extracted — the pension server
-    # requires exact slugs and doesn't fuzzy-match reliably from free text.
-    # Skip pre-fetch here; the improved system prompt ensures Letta calls the tool.
-    if _matches(user_input, _PENSION_KW):
-        ui.stage("Pre-fetch", "Pension query — Letta will call Pension_* tools")
-
-    # ── Exchange rates ───────────────────────────────────────────────────────────
-    if _matches(user_input, _REALTIME_KW):
-        ui.stage("Pre-fetch", "Currency query detected — fetching exchange rates…")
-        for code in ["USD", "EUR", "RUB"]:
-            if any(k in user_input.lower() for k in [code.lower(), code,
-                   {"USD": "dollar", "EUR": "euro евро", "RUB": "rub рубл"}.get(code, "")]):
-                data = await _call_tool_safe("RealTime_exchange_rate", {"currency_code": code})
-                if data and "error" not in data.lower():
-                    fetched.append(f"[Exchange rate {code}]\n{data}")
-        if not fetched:
-            # Fetch all three major rates
-            for code in ["USD", "EUR", "RUB"]:
-                data = await _call_tool_safe("RealTime_exchange_rate", {"currency_code": code})
-                if data and "error" not in data.lower():
-                    fetched.append(f"[Exchange rate {code}]\n{data}")
-
-    # ── Deposits ─────────────────────────────────────────────────────────────────
-    if _matches(user_input, _DEPOSIT_KW):
-        ui.stage("Pre-fetch", "Deposit query detected — fetching deposit list…")
-        data = await _call_tool_safe("Deposit_get_all_deposit_name", {})
-        if data and "error" not in data.lower():
-            fetched.append(f"[Deposit products]\n{data}")
-
-    # ── Credits ──────────────────────────────────────────────────────────────────
-    if _matches(user_input, _CREDIT_KW):
-        ui.stage("Pre-fetch", "Credit query detected — fetching credit list…")
-        data = await _call_tool_safe("Credit_get_all_credit_name", {})
-        if data and "error" not in data.lower():
-            fetched.append(f"[Credit products]\n{data}")
-
-    # ── Cards ────────────────────────────────────────────────────────────────────
-    if _matches(user_input, _CARD_KW):
-        ui.stage("Pre-fetch", "Card query detected — fetching card list…")
-        data = await _call_tool_safe("Card_get_all_card_name", {})
-        if data and "error" not in data.lower():
-            fetched.append(f"[Card products]\n{data}")
-
-    if fetched:
-        block = "\n\n".join(fetched)
-        ui.ok(f"Pre-fetched {len(fetched)} tool result(s) — injecting into context")
-        return (
-            "=== BANK DATA (fetched from live tools — use this, do NOT guess) ===\n"
-            + block
-            + "\n=== END BANK DATA ==="
-        )
-    return ""
-
 
 async def initialize() -> str:
     try:
@@ -239,15 +148,14 @@ async def process_turn(
     ui.kv("Agent",        f"{agent_id[:20]}…")
     ui.kv("Conversation", f"{conversation_id[:20]}…")
 
-    # ── 1. Build dynamic context (user docs — not managed by Letta) ────────────
+    # ── 1. Build dynamic context (injected into core memory context block) ───────
     user_docs = await get_user_docs(user_id)
     dynamic_context = ""
     if user_docs:
         doc_list        = "\n".join(f"  - {d}" for d in user_docs)
         dynamic_context = (
-            f"Documents uploaded by this user (searchable via RAG_rag_search, "
-            f"most recent first):\n{doc_list}\n"
-            f"When the user says 'this file' they mean: '{user_docs[0]}'"
+            f"User documents (search via RAG_rag_search, most recent first):\n{doc_list}\n"
+            f"When user says 'this file' → '{user_docs[0]}'"
         )
     ui.kv("Uploaded docs", ", ".join(user_docs) if user_docs else "none")
 
@@ -275,12 +183,7 @@ async def process_turn(
         if metadata is not None:
             metadata["evidence"] = evidence
     else:
-        ui.stage("System 1", "Fast mode — pre-fetching bank data then Letta")
-        # In fast mode System 2 doesn't run, so we pre-call bank tools ourselves
-        # to ensure the model has real data and doesn't answer from training.
-        bank_data = await _prefetch_bank_data(user_input)
-        if bank_data:
-            dynamic_context = (bank_data + "\n\n" + dynamic_context).strip()
+        ui.stage("System 1", "Fast mode — Letta + tools")
         if metadata is not None:
             metadata["evidence"] = ""
 

@@ -32,6 +32,8 @@ _LLM_MODEL    = "/models/gemma"
 _EMBED_MODEL  = "/models/embedding"
 _EMBED_DIM    = 2048
 _EMBED_CHUNK  = 300
+_CTX_WINDOW   = 22768  # ← change here, syncs to all agents automatically
+_HUMAN_LIMIT  = 250   # max chars for the human core-memory block
 
 # ── Agent system prompt (static bank instructions, set once at agent creation) ─
 
@@ -69,6 +71,8 @@ You MUST use that data to answer. Do NOT ignore it. Do NOT guess.
 6. Document question → call RAG_rag_search first.
 
 ## MEMORY RULES — MANDATORY, NO EXCEPTIONS
+
+### Writing facts
 Before writing ANY response, scan the user message for personal facts:
   - Name, age, profession, workplace, employer
   - City, country, location
@@ -81,7 +85,35 @@ If ANY personal fact is found:
   → NEVER just say "I noted" or "I will remember" without calling the tool.
   → If the fact updates an existing one → call core_memory_replace instead.
 
-This rule overrides everything. No exceptions.
+### CRITICAL — after any memory tool call
+After core_memory_append / memory_insert / core_memory_replace / memory_replace
+/ archival_memory_insert completes:
+  - The tool has done its job silently. Any internal system confirmation is NOT
+    a user message — do NOT respond to it.
+  - ALWAYS return to the user's ORIGINAL question and answer it fully.
+  - Your reply must address what the user actually asked, never the memory
+    system update itself.
+
+### Retrieving facts — memory search decision tree
+Core memory holds only the most recent facts (limited space). Older facts are
+moved to archival automatically when the block is full.
+
+Before answering ANY question where the answer is not already in context, decide:
+
+1. Is the query about something said or discussed in a PAST CONVERSATION?
+   (e.g. "did I ask about X before?", "what did we talk about?", "oldin nima degan edim?")
+   → Call conversation_search with the relevant query.
+
+2. Is the query about the USER's personal info, profile, or facts?
+   → Your context includes a [human] memory block that contains facts you have
+     already saved about this user (name, age, education, location, etc.).
+   → ALWAYS check that block first. If the answer is there — use it and answer
+     directly. Do NOT call any tool.
+   → Only call archival_memory_search if the fact is NOT present in [human].
+
+3. Both apply → call both tools before answering.
+
+NEVER guess or say "I don't know" without searching first.
 """
 
 PERSONA_BLOCK = """\
@@ -91,11 +123,15 @@ Respond in the user's language: Uzbek, Russian, or English.
 Be concise, factual, and helpful.
 Always call the matching bank tool before answering from general knowledge.
 
-MANDATORY MEMORY RULE:
-Every time the user shares a personal fact (name, job, location, education,
-travel, preferences, or anything personal) you MUST call core_memory_append
-with label="human" BEFORE responding. Never skip this tool call.
-If it replaces an old fact → call core_memory_replace instead.
+MANDATORY MEMORY RULES:
+1. WRITING: When the user shares any personal fact → call core_memory_append
+   (label="human") BEFORE responding. Never skip. If it updates an old fact →
+   call core_memory_replace instead. After the tool completes, answer the
+   user's original question — never respond to system confirmations.
+2. READING: When asked about the user (name, age, education, job, etc.) →
+   check your [human] memory block first. It contains facts you already saved.
+   If the answer is there — use it directly, no tool call needed.
+   If not found in [human] → call archival_memory_search.
 """
 
 # ── File-backed stores ─────────────────────────────────────────────────────────
@@ -161,11 +197,26 @@ def _create_or_find_agent_sync(user_id: str) -> Optional[str]:
         items  = agents if isinstance(agents, list) else getattr(agents, "data", [])
         if items:
             agent_id = items[0].id
-            # Clear any RequiresApproval tool_rules so the agent never waits for human approval
             try:
-                client.agents.update(agent_id=agent_id, tool_rules=[])
+                client.agents.update(agent_id=agent_id, tool_rules=[], llm_config={
+                    "model":               _LLM_MODEL,
+                    "model_endpoint_type": "openai",
+                    "model_endpoint":      _LLM_BASE_URL,
+                    "context_window":      _CTX_WINDOW,
+                })
             except Exception:
                 pass
+            # Sync human block limit on the server so core_memory_append
+            # is also rejected server-side when the block is full.
+            try:
+                blocks = client.agents.blocks.list(agent_id=agent_id)
+                block_items = blocks if isinstance(blocks, list) else getattr(blocks, "data", getattr(blocks, "items", []))
+                for blk in block_items:
+                    if getattr(blk, "label", "") == "human":
+                        client.blocks.update(block_id=blk.id, limit=_HUMAN_LIMIT)
+            except Exception:
+                pass
+            _ensure_archival_tools_sync(client, agent_id)
             return agent_id
     except Exception as e:
         ui.warn(f"[letta_mem] Agent list failed (will create): {e}")
@@ -175,21 +226,23 @@ def _create_or_find_agent_sync(user_id: str) -> Optional[str]:
             description=f"Xazna bank assistant — user {user_id}",
             system=_BANK_SYSTEM,
             memory_blocks=[
-                {"label": "persona", "value": PERSONA_BLOCK, "limit": 2000},
+                {"label": "persona", "value": PERSONA_BLOCK, "limit": 600},
                 {
                     "label": "human",
-                    "value": (
-                        f"User ID: {user_id}\n"
-                        "Known preferences, facts, and context will be populated here."
-                    ),
-                    "limit": 1500,
+                    "value": f"User ID: {user_id}\n",
+                    "limit": 250,
+                },
+                {
+                    "label": "context",
+                    "value": "Current date: (updated each turn)\nLast document: none",
+                    "limit": 400,
                 },
             ],
             llm_config={
-                "model": _LLM_MODEL,
+                "model":               _LLM_MODEL,
                 "model_endpoint_type": "openai",
-                "model_endpoint": _LLM_BASE_URL,
-                "context_window": 32768,
+                "model_endpoint":      _LLM_BASE_URL,
+                "context_window":      _CTX_WINDOW,
             },
             embedding_config={
                 "embedding_model": _EMBED_MODEL,
@@ -202,10 +255,40 @@ def _create_or_find_agent_sync(user_id: str) -> Optional[str]:
             tool_rules=[],
         )
         ui.ok(f"[letta_mem] Created agent {agent.id[:16]}… for user {user_id}")
+        _ensure_archival_tools_sync(client, agent.id)
         return agent.id
     except Exception as e:
         ui.warn(f"[letta_mem] Agent creation failed for {user_id}: {e}")
         return None
+
+
+def _ensure_archival_tools_sync(client, agent_id: str) -> None:
+    """Attach archival_memory_insert and archival_memory_search if not already on the agent."""
+    _REQUIRED = {"archival_memory_insert", "archival_memory_search"}
+    try:
+        existing = {getattr(t, "name", "") for t in (
+            client.agents.tools.list(agent_id=agent_id)
+            if isinstance(client.agents.tools.list(agent_id=agent_id), list)
+            else getattr(client.agents.tools.list(agent_id=agent_id), "data",
+                         getattr(client.agents.tools.list(agent_id=agent_id), "items", []))
+        )}
+    except Exception:
+        existing = set()
+
+    missing = _REQUIRED - existing
+    if not missing:
+        return
+
+    try:
+        all_tools = client.tools.list()
+        all_tools = all_tools if isinstance(all_tools, list) else getattr(all_tools, "data", getattr(all_tools, "items", []))
+        for name in missing:
+            tool = next((t for t in all_tools if getattr(t, "name", "") == name), None)
+            if tool:
+                client.agents.tools.attach(agent_id=agent_id, tool_id=tool.id)
+                ui.ok(f"[letta_mem] Attached tool: {name}")
+    except Exception as e:
+        ui.warn(f"[letta_mem] Could not attach archival tools: {e}")
 
 
 def _clear_agent_tool_rules_sync(agent_id: str) -> None:
@@ -306,6 +389,23 @@ async def set_active_conversation(user_id: str, conv_id: str) -> None:
     _save_store(_CONV_STORE, store)
 
 
+def _count_conv_msgs_sync(client, conv_id: str, agent_id: str) -> int:
+    """Count user+assistant messages in a conversation (local server call is fast)."""
+    try:
+        result = client.conversations.messages.list(
+            conversation_id=conv_id,
+            agent_id=agent_id,
+            limit=500,
+            include_return_message_types=["user_message", "assistant_message"],
+        )
+        items = result.items if hasattr(result, "items") else (
+            result if isinstance(result, list) else getattr(result, "data", [])
+        )
+        return len(items)
+    except Exception:
+        return 0
+
+
 def _list_convs_sync(agent_id: str, limit: int = 20) -> list[dict]:
     client = _get_client()
     if client is None:
@@ -316,15 +416,20 @@ def _list_convs_sync(agent_id: str, limit: int = 20) -> list[dict]:
             order_by="last_message_at", order="desc",
         )
         items = result if isinstance(result, list) else getattr(result, "data", getattr(result, "items", []))
-        return [
-            {
-                "id":            getattr(c, "id", ""),
+        convs = []
+        for c in items:
+            conv_id = getattr(c, "id", "")
+            # Letta API often returns message_count=None — count manually as fallback
+            msg_count = getattr(c, "message_count", None)
+            if not msg_count:
+                msg_count = _count_conv_msgs_sync(client, conv_id, agent_id)
+            convs.append({
+                "id":            conv_id,
                 "title":         getattr(c, "summary", None) or "Session",
                 "created_at":    str(getattr(c, "created_at", "")),
-                "message_count": getattr(c, "message_count", 0),
-            }
-            for c in items
-        ]
+                "message_count": msg_count,
+            })
+        return convs
     except Exception as e:
         ui.warn(f"[letta_mem] Conversation list failed: {e}")
         return []
@@ -363,6 +468,8 @@ def _get_conv_messages_sync(conv_id: str, agent_id: str, limit: int = 20) -> lis
                     if hasattr(part, "text"):
                         parts.append(part.text)
                 content = "".join(parts)
+            if _is_system_alert(content) or _is_letta_noise(content):
+                continue
             out.append({"role": role, "content": content})
         return out
     except Exception as e:
@@ -478,6 +585,32 @@ async def insert_passage(agent_id: str, text: str) -> None:
     await asyncio.to_thread(_insert_passage_sync, agent_id, text)
 
 
+# ── Built-in tool definitions (memory tools injected server-side by Letta) ───
+
+def _get_builtin_tools_sync(agent_id: str) -> list[dict]:
+    """Return the built-in tool schemas Letta injects into the LLM context."""
+    client = _get_client()
+    if client is None:
+        return []
+    try:
+        result = client.agents.tools.list(agent_id=agent_id)
+        items  = result if isinstance(result, list) else getattr(result, "data", getattr(result, "items", []))
+        tools  = []
+        for t in items:
+            name = getattr(t, "name", "") or ""
+            # Only built-in Letta memory/recall tools — not our client tools
+            if any(kw in name for kw in ("memory", "archival", "conversation_search", "recall")):
+                tools.append({
+                    "name":        name,
+                    "description": getattr(t, "description", "") or "",
+                    "parameters":  getattr(t, "json_schema", {}) or {},
+                })
+        return tools
+    except Exception as e:
+        ui.warn(f"[letta_mem] Built-in tool list failed: {e}")
+        return []
+
+
 # ── Core Memory (Blocks) ──────────────────────────────────────────────────────
 
 def _get_blocks_sync(agent_id: str) -> dict[str, str]:
@@ -505,15 +638,27 @@ def _update_block_sync(agent_id: str, label: str, value: str) -> None:
         return
     try:
         client.agents.blocks.update(block_label=label, agent_id=agent_id, value=value)
-    except Exception as e:
-        ui.warn(f"[letta_mem] Block update failed (label='{label}'): {e}")
+    except Exception:
+        # Block doesn't exist yet — create it on the agent
+        try:
+            block = client.blocks.create(label=label, value=value, limit=500)
+            client.agents.blocks.attach(agent_id=agent_id, block_id=block.id)
+        except Exception as e:
+            ui.warn(f"[letta_mem] Block create/attach failed (label='{label}'): {e}")
 
 
 async def update_core_memory(agent_id: str, label: str, value: str) -> None:
     await asyncio.to_thread(_update_block_sync, agent_id, label, value)
 
 
-async def append_human_facts(agent_id: str, new_facts: list[str], limit: int = 1500) -> None:
+async def append_human_facts(agent_id: str, new_facts: list[str], limit: int = _HUMAN_LIMIT) -> None:
+    """
+    Append personal facts to the human core memory block.
+
+    Overflow policy: when adding new facts would exceed `limit`, the oldest
+    lines are evicted from core memory and written to archival memory first,
+    so nothing is lost — it's just moved to a cheaper tier.
+    """
     if not new_facts:
         return
     current = (await get_core_memory(agent_id)).get("human", "")
@@ -523,12 +668,57 @@ async def append_human_facts(agent_id: str, new_facts: list[str], limit: int = 1
         fact = fact.strip().lstrip("- ")
         if fact and fact not in current:
             lines.append(f"- {fact}")
+
     combined = "\n".join(lines)
+
+    # Evict oldest lines to archival when over limit
+    evicted: list[str] = []
     while len(combined) > limit and "\n" in combined:
-        combined = combined[combined.index("\n") + 1:]
+        first_newline = combined.index("\n")
+        evicted_line  = combined[:first_newline].strip()
+        combined      = combined[first_newline + 1:]
+        if evicted_line:
+            evicted.append(evicted_line)
+
     combined = combined[:limit]
+
+    if evicted:
+        passage = "Evicted from core memory:\n" + "\n".join(evicted)
+        await insert_passage(agent_id, passage)
+        ui.warn(f"[letta_mem] Core memory full — moved {len(evicted)} fact(s) to archival")
+
     if combined != current:
         await update_core_memory(agent_id, "human", combined)
+
+
+async def trim_human_block(agent_id: str) -> None:
+    """
+    Called after every inference turn to enforce _HUMAN_LIMIT on the human block.
+    The LLM calls core_memory_append directly (bypassing our Python logic), so
+    this post-inference trim keeps the block within its character limit.
+    Oldest facts are evicted to archival — nothing is lost.
+    """
+    current = (await get_core_memory(agent_id)).get("human", "")
+    if len(current) <= _HUMAN_LIMIT:
+        return
+
+    lines    = [l for l in current.splitlines() if l.strip()]
+    combined = "\n".join(lines)
+    evicted: list[str] = []
+    while len(combined) > _HUMAN_LIMIT and "\n" in combined:
+        idx          = combined.index("\n")
+        evicted_line = combined[:idx].strip()
+        combined     = combined[idx + 1:]
+        if evicted_line:
+            evicted.append(evicted_line)
+    combined = combined[:_HUMAN_LIMIT]
+
+    if evicted:
+        passage = "Evicted from core memory (human block full):\n" + "\n".join(evicted)
+        await insert_passage(agent_id, passage)
+        ui.warn(f"[letta_mem] Human block trimmed — {len(evicted)} old fact(s) → archival")
+
+    await update_core_memory(agent_id, "human", combined)
 
 
 _MEMORY_TOOL_KEYWORDS = ("memory", "archival", "recall", "core_memory")
@@ -536,6 +726,88 @@ _MEMORY_TOOL_KEYWORDS = ("memory", "archival", "recall", "core_memory")
 def _is_memory_tool(name: str) -> bool:
     n = name.lower()
     return any(k in n for k in _MEMORY_TOOL_KEYWORDS)
+
+
+def _trim_recall_to_budget(turns: list[dict], budget_tokens: int) -> list[dict]:
+    """Keep only the most recent turns that fit within budget_tokens."""
+    kept, total = [], 0
+    for turn in reversed(turns):
+        tok = max(1, len(turn.get("content", "")) // 4)
+        if total + tok > budget_tokens:
+            break
+        total += tok
+        kept.insert(0, turn)
+    return kept
+
+
+def _is_system_alert(content: str) -> bool:
+    """Letta injects JSON system_alert messages as user_message when context is compressed."""
+    s = content.strip()
+    return s.startswith("{") and "system_alert" in s
+
+
+_LETTA_NOISE_PHRASES = (
+    "i have received the system",
+    "system alert",
+    "fully operational and ready",
+    "i am now fully operational",
+    "previous memory tool error",
+    "system update and am ready",
+    "ready to continue assisting",
+    "i am ready to assist you",
+    "am now ready to assist",
+    "please let me know how i can help you today with xazna",
+    "summary of our previous interactions",
+    "summary of our previous interaction",
+)
+
+def _is_letta_noise(text: str) -> bool:
+    """Detect Letta's internal system-confirmation responses that leak to the user."""
+    lower = text.lower()
+    return any(p in lower for p in _LETTA_NOISE_PHRASES)
+
+
+def _get_recent_turns_sync(conv_id: str, agent_id: str, limit: int = 300) -> list[dict]:
+    """
+    Fetch the most recent user+assistant messages from a specific conversation,
+    returned in chronological order (oldest first).
+
+    Uses order="desc" to get the NEWEST messages, then reverses so the caller
+    sees them in correct time order. This ensures the recall display always
+    shows recent context from THIS session — never from other sessions.
+    """
+    client = _get_client()
+    if client is None:
+        return []
+    try:
+        result = client.conversations.messages.list(
+            conversation_id=conv_id,
+            agent_id=agent_id,
+            limit=limit,
+            order="desc",   # newest first so we always get the last `limit` turns
+            include_return_message_types=["user_message", "assistant_message"],
+        )
+        items = result.items if hasattr(result, "items") else (
+            result if isinstance(result, list) else getattr(result, "data", [])
+        )
+        out = []
+        for m in items:
+            mt = getattr(m, "message_type", "")
+            if mt not in ("user_message", "assistant_message"):
+                continue
+            role = "user" if mt == "user_message" else "assistant"
+            content = getattr(m, "content", "") or ""
+            if not isinstance(content, str):
+                content = "".join(
+                    getattr(p, "text", "") for p in (content if isinstance(content, list) else [])
+                )
+            if _is_system_alert(content) or _is_letta_noise(content):
+                continue
+            out.append({"role": role, "content": content})
+        return list(reversed(out))   # back to chronological order for display
+    except Exception as e:
+        ui.warn(f"[letta_mem] Recent turns fetch failed: {e}")
+        return []
 
 
 # ── Letta Inference — routes through conversations API ────────────────────────
@@ -557,6 +829,27 @@ def _msg_text(msg) -> str:
 
 def _call_letta_sync(client, conversation_id: str, agent_id: str, kwargs: dict):
     return client.conversations.messages.create(conversation_id, **kwargs)
+
+
+def _set_effective_ctx_window_sync(agent_id: str, effective_ctx: int) -> None:
+    """
+    Update the agent's context_window to the effective value (full window minus
+    client_tools overhead). This makes Letta allocate recall to fill exactly the
+    remaining space — context is always used 100%:
+        tools + system + core + recall = ctx_window
+    """
+    client = _get_client()
+    if client is None:
+        return
+    try:
+        client.agents.update(agent_id=agent_id, llm_config={
+            "model":               _LLM_MODEL,
+            "model_endpoint_type": "openai",
+            "model_endpoint":      _LLM_BASE_URL,
+            "context_window":      effective_ctx,
+        })
+    except Exception as e:
+        ui.warn(f"[letta_mem] Could not update effective context window: {e}")
 
 
 _APPROVAL_CONFLICT_MSG = "waiting for approval on a tool call"
@@ -647,26 +940,49 @@ async def letta_inference(
     if client is None:
         return "Memory service unavailable — Letta server not reachable."
 
-    now = datetime.now()
+    # Update the context block in core memory with current date/time and last document.
+    # This keeps date + doc info in core memory (always visible) instead of
+    # polluting every user message stored in recall memory.
+    now      = datetime.now()
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M")
-    turn_context = f"Current date: {date_str} | Time: {time_str} (UTC+5 Tashkent)"
+    ctx_value = f"Current date: {date_str}\nCurrent time: {time_str} (UTC+5 Tashkent)"
     if dynamic_context:
-        turn_context += f"\n{dynamic_context}"
+        ctx_value += f"\n{dynamic_context}"
+    await asyncio.to_thread(_update_block_sync, agent_id, "context", ctx_value)
 
-    # Prepend lightweight turn context to the user input so Letta stores it in recall
-    full_input = f"[{turn_context}]\n\n{user_input}" if turn_context else user_input
+    full_input = user_input
 
-    # Show everything Letta will inject into the LLM context this turn
-    blocks, recent_turns = await asyncio.gather(
+    # Show everything Letta will inject into the LLM context this turn.
+    # Fetch enough recall messages to reflect what Letta actually sends (up to 20).
+    blocks, recent_turns, builtin_tools = await asyncio.gather(
         asyncio.to_thread(_get_blocks_sync, agent_id),
-        asyncio.to_thread(_get_conv_messages_sync, conversation_id, agent_id, 6),
+        asyncio.to_thread(_get_recent_turns_sync, conversation_id, agent_id, 50),
+        asyncio.to_thread(_get_builtin_tools_sync, agent_id),
     )
-    tools_tok = sum(
+    all_tools  = client_tools + builtin_tools
+    tools_tok  = sum(
         len(t.get("name", "")) + len(t.get("description", "")) + len(json.dumps(t.get("parameters", {})))
-        for t in client_tools
+        for t in all_tools
     ) // 4
-    ui.letta_context_dump(_BANK_SYSTEM, blocks, recent_turns, full_input, tools_tok)
+    system_tok = len(_BANK_SYSTEM) // 4
+    core_tok   = sum(len(v) for v in blocks.values()) // 4
+    input_tok  = max(1, len(full_input) // 4)
+
+    # Recall budget = whatever is left after all fixed content.
+    # Cap recent_turns to this budget so the display and Letta both see ≤100%.
+    recall_budget = max(200, _CTX_WINDOW - tools_tok - system_tok - core_tok - input_tok)
+    recent_turns  = _trim_recall_to_budget(recent_turns, recall_budget)
+
+    # Tell Letta the effective window = _CTX_WINDOW minus client_tools overhead.
+    # Computed from _CTX_WINDOW constant, never from the agent's stored value
+    # (reading it back would create a feedback loop shrinking the window each turn).
+    effective_ctx = max(1500, _CTX_WINDOW - tools_tok)
+    await asyncio.to_thread(_set_effective_ctx_window_sync, agent_id, effective_ctx)
+
+    ui.letta_context_dump(_BANK_SYSTEM, blocks, recent_turns, full_input, tools_tok,
+                          builtin_tool_names=[t["name"] for t in builtin_tools],
+                          ctx_window=_CTX_WINDOW)
 
     step_kwargs: dict   = {}
     final_text: str     = ""
@@ -763,7 +1079,7 @@ async def letta_inference(
                 text = _msg_text(ev)
                 if text:
                     final_text = text
-                    if stream_callback:
+                    if stream_callback and not _is_letta_noise(text):
                         result = stream_callback(text)
                         if asyncio.iscoroutine(result):
                             await result
@@ -785,9 +1101,11 @@ async def letta_inference(
                         ui.memory_call(tool_name, args_dict)
                     else:
                         ui.tool_call(tool_name, json.dumps(args_dict, ensure_ascii=False))
-                    pending_tool_calls.append(tc)
+                    if getattr(tc, "tool_call_id", None) not in {getattr(x, "tool_call_id", None) for x in pending_tool_calls}:
+                        pending_tool_calls.append(tc)
                 for tc2 in (getattr(ev, "tool_calls", None) or []):
-                    pending_tool_calls.append(tc2)
+                    if getattr(tc2, "tool_call_id", None) not in {getattr(x, "tool_call_id", None) for x in pending_tool_calls}:
+                        pending_tool_calls.append(tc2)
 
             elif mt == "tool_return_message":
                 # Letta already executed this tool server-side.
@@ -811,8 +1129,10 @@ async def letta_inference(
                 # as tool_call_message: execute the tool and send back a tool_return.
                 tc = getattr(ev, "tool_call", None)
                 if tc:
-                    pending_tool_calls.append(tc)
-                    ui.warn(f"[letta] Client tool requested (via approval): {getattr(tc, 'name', '?')}")
+                    tc_id = getattr(tc, "tool_call_id", None)
+                    if tc_id not in {getattr(x, "tool_call_id", None) for x in pending_tool_calls}:
+                        pending_tool_calls.append(tc)
+                        ui.warn(f"[letta] Client tool requested (via approval): {getattr(tc, 'name', '?')}")
 
         # Drop tools already executed server-side — only run what Letta handed back to us
         pending_tool_calls = [
@@ -866,6 +1186,38 @@ async def letta_inference(
         step_kwargs = {
             "tool_returns": [{"type": "tool_return", "tool_returns": tool_returns}]
         }
+
+    # Enforce human block limit after each turn — LLM calls core_memory_append
+    # directly and can exceed _HUMAN_LIMIT. Evict oldest facts to archival here.
+    await trim_human_block(agent_id)
+
+    # After memory-tool turns Letta injects a system user_message internally,
+    # causing Gemma to respond to the system notification instead of the user.
+    # Detect and discard that noise, then ask Letta for the real answer.
+    if final_text and _is_letta_noise(final_text):
+        ui.warn("[letta_inference] Letta system noise detected — requesting real answer")
+        final_text = ""
+        try:
+            def _real_answer():
+                return list(client.conversations.messages.create(
+                    conversation_id,
+                    agent_id=agent_id,
+                    input=full_input,
+                    client_tools=client_tools,
+                ))
+            real_events = await asyncio.to_thread(_real_answer)
+            for ev in real_events:
+                if getattr(ev, "message_type", "") == "assistant_message":
+                    text = _msg_text(ev)
+                    if text and not _is_letta_noise(text):
+                        final_text = text
+                        if stream_callback:
+                            result = stream_callback(text)
+                            if asyncio.iscoroutine(result):
+                                await result
+                        break
+        except Exception as e:
+            ui.warn(f"[letta_inference] Real answer retry failed: {e}")
 
     return final_text
 

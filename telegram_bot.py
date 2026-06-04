@@ -24,6 +24,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    ForceReply,
     BotCommand,
 )
 from aiogram.filters import CommandStart, Command
@@ -43,7 +44,7 @@ import config
 from agent import process_turn, initialize
 from memory.session import (
     clear_session, add_user_doc,
-    create_session, switch_session,
+    create_session, switch_session, rename_session,
     get_sessions_list, get_current_session_id,
 )
 from tools.ingestion import ingest_document
@@ -99,6 +100,7 @@ class _TelegramStreamer:
 
 
 _settings: dict[int, dict] = {}
+_pending_renames: dict[int, str] = {}  # uid → session_id waiting for new name
 
 
 def _get_deepthink(uid: int) -> bool:
@@ -136,10 +138,24 @@ def _sessions_keyboard(
     rows = []
     for s in sessions[:15]:
         icon  = "✅" if s["id"] == current_sid else "📝"
-        title = s["title"][:28]
+        title = s["title"][:30]
         count = s.get("message_count", 0)
-        label = f"{icon} {title} ({count} msg{'s' if count != 1 else ''})"
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"switch:{s['id']}")])
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{icon} {title}",
+                callback_data=f"switch:{s['id']}",
+            ),
+        ])
+        rows.append([
+            InlineKeyboardButton(
+                text=f"💬 {count} msg{'s' if count != 1 else ''}",
+                callback_data="noop",
+            ),
+            InlineKeyboardButton(
+                text="✏️",
+                callback_data=f"rename:{s['id']}",
+            ),
+        ])
     rows.append([
         InlineKeyboardButton(text="➕ New Session", callback_data="new_session"),
         InlineKeyboardButton(text="← Back",        callback_data="session_back"),
@@ -367,6 +383,29 @@ async def cb_session_back(cb: CallbackQuery) -> None:
         pass
 
 
+@router.callback_query(F.data.startswith("rename:"))
+async def cb_rename_session(cb: CallbackQuery) -> None:
+    uid = cb.from_user.id
+    sid = cb.data.split(":", 1)[1]
+    _pending_renames[uid] = sid
+    await cb.answer("Type the new name")
+    await cb.message.answer(
+        "✏️ <b>Rename session</b>\n"
+        "Send the new name, or /cancel to abort:",
+        reply_markup=ForceReply(selective=True),
+    )
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message) -> None:
+    uid = message.from_user.id
+    if uid in _pending_renames:
+        del _pending_renames[uid]
+        await message.answer("❌ Rename cancelled.", reply_markup=_keyboard(uid))
+    else:
+        await message.answer("Nothing to cancel.", reply_markup=_keyboard(uid))
+
+
 @router.message(F.document)
 async def handle_document(message: Message) -> None:
     uid  = message.from_user.id
@@ -412,6 +451,19 @@ async def handle_message(message: Message) -> None:
     uid  = message.from_user.id
     text = (message.text or "").strip()
     if not text:
+        return
+
+    # Intercept pending rename — any non-command message becomes the new title
+    if uid in _pending_renames and not text.startswith("/"):
+        sid       = _pending_renames.pop(uid)
+        new_title = text[:80]
+        await rename_session(sid, new_title)
+        sessions    = await get_sessions_list(str(uid))
+        current_sid = await get_current_session_id(str(uid))
+        await message.answer(
+            f"✅ Session renamed to <b>{_html.escape(new_title)}</b>",
+            reply_markup=_sessions_keyboard(uid, sessions, current_sid),
+        )
         return
 
     deepthink   = _get_deepthink(uid)

@@ -324,6 +324,8 @@ def letta_context_dump(
     recent_turns: list[dict],
     user_input: str = "",
     tools_token_count: int = 0,
+    builtin_tool_names: list[str] | None = None,
+    ctx_window: int = 32768,
 ) -> None:
     """Show the complete LLM context + per-section token estimates in one panel.
 
@@ -347,15 +349,27 @@ def letta_context_dump(
     core_tok  = _tok(core_text)
     lines.append(Text(f"\n── CORE MEMORY  ≈{core_tok:,} tok ──────────────────────", style="dim"))
     for label, value in blocks.items():
-        lines.append(Text(f"[{label}]", style="bold cyan"))
+        block_tok = _tok(value or "")
+        lines.append(Text(f"[{label}]  ≈{block_tok} tok", style="bold cyan"))
         lines.append(Text(value.strip() if value else "(empty)", style="cyan dim"))
 
     # ── Recall Memory ─────────────────────────────────────────────────────────
     recall_text = "\n".join(m.get("content", "") for m in recent_turns)
     recall_tok  = _tok(recall_text) if recent_turns else 0
-    lines.append(Text(f"\n── RECALL MEMORY  ≈{recall_tok:,} tok ──────────────────", style="dim"))
+    n_turns     = len(recent_turns)
+    lines.append(Text(
+        f"\n── RECALL MEMORY  ≈{recall_tok:,} tok  ({n_turns} turns) ───────────",
+        style="dim",
+    ))
     if recent_turns:
-        for m in recent_turns[-6:]:
+        # Skip consecutive same-role messages (keep last of each run)
+        deduped: list = []
+        for m in recent_turns:
+            if deduped and deduped[-1].get("role") == m.get("role"):
+                deduped[-1] = m  # replace with more recent same-role msg
+            else:
+                deduped.append(m)
+        for m in deduped:
             role    = m.get("role", "?")
             color   = "green" if role == "user" else "blue"
             tag     = "USER " if role == "user" else "AGENT"
@@ -363,6 +377,11 @@ def letta_context_dump(
             lines.append(Text(f"[{tag}] {content}", style=color + " dim"))
     else:
         lines.append(Text("(no turns yet)", style="dim"))
+
+    # ── Built-in Letta Tools (memory tools injected server-side) ──────────────
+    if builtin_tool_names:
+        lines.append(Text(f"\n── LETTA BUILT-IN TOOLS  ({len(builtin_tool_names)} tools) ──────────────────", style="dim"))
+        lines.append(Text("  " + "  ".join(builtin_tool_names), style="magenta dim"))
 
     # ── User Message ──────────────────────────────────────────────────────────
     input_tok = _tok(user_input)
@@ -379,8 +398,8 @@ def letta_context_dump(
         style="dim",
     ))
     lines.append(Text(
-        f"  TOTAL ≈ {total:,} tokens  /  32,768 context window  "
-        f"({total / 32768 * 100:.0f}% used)",
+        f"  TOTAL ≈ {total:,} tokens  /  {ctx_window:,} context window  "
+        f"({total / ctx_window * 100:.0f}% used)",
         style="bold yellow",
     ))
 

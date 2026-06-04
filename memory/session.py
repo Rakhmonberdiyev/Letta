@@ -100,8 +100,11 @@ async def create_session(user_id: str, title: str = "New Session") -> str:
 
 
 async def switch_session(user_id: str, session_id: str) -> bool:
-    from memory.letta_mem import _verify_conv_sync, set_active_conversation
-    valid = await asyncio.to_thread(_verify_conv_sync, session_id)
+    from memory.letta_mem import get_or_create_agent, _verify_conv_sync, set_active_conversation
+    agent_id = await get_or_create_agent(user_id)
+    if not agent_id:
+        return False
+    valid = await asyncio.to_thread(_verify_conv_sync, session_id, agent_id)
     if not valid:
         return False
     await set_active_conversation(user_id, session_id)
@@ -189,6 +192,12 @@ async def save_session_summary(user_id: str, summary: str) -> None:
         await update_conv_summary(conv_id, summary)
 
 
+async def rename_session(session_id: str, title: str) -> None:
+    """Rename any session by its ID (does not require it to be active)."""
+    from memory.letta_mem import update_conv_summary
+    await update_conv_summary(session_id, title)
+
+
 # ── User-uploaded documents (local SQLite) ────────────────────────────────────
 
 async def get_user_docs(user_id: str) -> list[str]:
@@ -197,3 +206,11 @@ async def get_user_docs(user_id: str) -> list[str]:
 
 async def add_user_doc(user_id: str, filename: str) -> None:
     await asyncio.to_thread(_add_doc_sync, user_id, filename)
+    # Write updated doc list to core memory so it's visible in all sessions.
+    from memory.letta_mem import get_or_create_agent, append_human_facts
+    agent_id = await get_or_create_agent(user_id)
+    if agent_id:
+        docs = await get_user_docs(user_id)
+        doc_lines = [f"Uploaded documents (most recent first): {', '.join(docs)}"]
+        doc_lines.append(f"Last uploaded file: {docs[0]}")
+        await append_human_facts(agent_id, doc_lines)
