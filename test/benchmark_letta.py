@@ -581,6 +581,7 @@ def run_benchmark() -> None:
     print("Sections: Core Memory | Recall Memory | Archival Memory")
     print()
 
+
     agent = client.agents.create(
         name="mem_benchmark_agent_v2",
         description="Comprehensive memory-rules benchmark agent",
